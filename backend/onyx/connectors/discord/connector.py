@@ -26,6 +26,8 @@ from onyx.connectors.models import (
     ImageSection,
     TextSection,
 )
+from onyx.configs.constants import FileOrigin
+from onyx.file_processing.image_utils import store_image_and_create_section
 from onyx.utils.logger import setup_logger
 
 logger = setup_logger()
@@ -37,7 +39,7 @@ _SNIPPET_LENGTH = 30
 
 def _convert_message_to_document(
     message: DiscordMessage,
-    sections: list[TextSection],
+    sections: list[TextSection | ImageSection],
 ) -> Document:
     """
     Convert a discord message to a document
@@ -90,6 +92,54 @@ def _convert_message_to_document(
     )
 
 
+async def _build_attachment_sections(
+    message: DiscordMessage,
+) -> list[TextSection | ImageSection]:
+    """
+    Downloads any image attachments on a message and stores them via Onyx's
+    shared file store, following the same store_image_and_create_section
+    pattern used by ConfluenceConnector. Non-image attachments are skipped
+    for now (e.g. arbitrary files) — only image/* content types are handled.
+    """
+    sections: list[TextSection | ImageSection] = []
+
+    for attachment in message.attachments:
+        if not attachment.content_type or not attachment.content_type.startswith(
+            "image/"
+        ):
+            continue
+
+        try:
+            image_data = await attachment.read()
+        except Exception:
+            logger.warning(
+                "Failed to download Discord attachment %s on message %s",
+                attachment.id,
+                message.id,
+            )
+            continue
+
+        try:
+            image_section, _ = store_image_and_create_section(
+                image_data=image_data,
+                file_id=f"discord_attachment_{attachment.id}",
+                display_name=attachment.filename,
+                link=attachment.url,
+                media_type=attachment.content_type,
+                file_origin=FileOrigin.CONNECTOR,
+            )
+            sections.append(image_section)
+        except Exception:
+            logger.warning(
+                "Failed to store Discord attachment %s on message %s",
+                attachment.id,
+                message.id,
+            )
+            continue
+
+    return sections
+
+
 async def _fetch_filtered_channels(
     discord_client: Client,
     server_ids: list[int] | None,
@@ -116,6 +166,7 @@ async def _fetch_documents_from_channel(
     channel: TextChannel,
     start_time: datetime | None,
     end_time: datetime | None,
+    include_attachments: bool,
 ) -> AsyncIterable[Document]:
     # Discord's epoch starts at 2015-01-01
     discord_epoch = datetime(2015, 1, 1, tzinfo=timezone.utc)
@@ -136,12 +187,14 @@ async def _fetch_documents_from_channel(
         if channel_message.type != MessageType.default:
             continue
 
-        sections: list[TextSection] = [
+        sections: list[TextSection | ImageSection] = [
             TextSection(
                 text=channel_message.content,
                 link=channel_message.jump_url,
             )
         ]
+        if include_attachments:
+            sections.extend(await _build_attachment_sections(channel_message))
 
         yield _convert_message_to_document(channel_message, sections)
 
@@ -161,6 +214,8 @@ async def _fetch_documents_from_channel(
                     link=thread_message.jump_url,
                 )
             ]
+            if include_attachments:
+                sections.extend(await _build_attachment_sections(thread_message))
 
             yield _convert_message_to_document(thread_message, sections)
 
@@ -182,6 +237,8 @@ async def _fetch_documents_from_channel(
                     link=thread_message.jump_url,
                 )
             ]
+            if include_attachments:
+                sections.extend(await _build_attachment_sections(thread_message))
 
             yield _convert_message_to_document(thread_message, sections)
 
@@ -191,6 +248,7 @@ def _manage_async_retrieval(
     requested_start_date_string: str,
     channel_names: list[str],
     server_ids: list[int],
+    include_attachments: bool,
     start: datetime | None = None,
     end: datetime | None = None,
 ) -> Iterable[Document]:
@@ -237,6 +295,7 @@ def _manage_async_retrieval(
                     channel=channel,
                     start_time=start_time,
                     end_time=end_time,
+                    include_attachments=include_attachments,
                 ):
                     yield doc
 
@@ -271,6 +330,7 @@ class DiscordConnector(PollConnector, LoadConnector):
         # YYYY-MM-DD
         start_date: str | None = None,
         batch_size: int = INDEX_BATCH_SIZE,
+        include_attachments: bool = False,
     ):
         if channel_names is None:
             channel_names = []
@@ -283,6 +343,10 @@ class DiscordConnector(PollConnector, LoadConnector):
         )
         self._discord_bot_token: str | None = None
         self.requested_start_date_string: str = start_date or ""
+        # Opt-in flag: whether to download and index image attachments on
+        # messages. Defaults to False since this is a new addition — see
+        # backend/onyx/connectors/README.md "Supporting Include Attachments".
+        self.include_attachments = include_attachments
 
     @property
     def discord_bot_token(self) -> str:
@@ -318,6 +382,7 @@ class DiscordConnector(PollConnector, LoadConnector):
             requested_start_date_string=self.requested_start_date_string,
             channel_names=self.channel_names,
             server_ids=self.server_ids,
+            include_attachments=self.include_attachments,
             start=start,
             end=end,
         ):
@@ -357,6 +422,8 @@ if __name__ == "__main__":
         server_ids=server_ids.split(",") if server_ids else [],
         channel_names=channel_names.split(",") if channel_names else [],
         start_date=os.environ.get("start_date", None),
+        include_attachments=os.environ.get("include_attachments", "false").lower()
+        == "true",
     )
     connector.load_credentials(
         {"discord_bot_token": os.environ.get("discord_bot_token")}
